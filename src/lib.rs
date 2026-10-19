@@ -69,7 +69,8 @@ pub struct ConcurrentHashMap<K, V, S = RandomState> {
 
 impl<K, V, S> ConcurrentHashMap<K, V, S>
 where
-    K: Hash + Eq,
+    K: Sync + Send + Hash + Eq,
+    V: Sync + Send,
     S: BuildHasher,
 {
     fn hash(&self, key: &K) -> u64 {
@@ -140,9 +141,10 @@ where
 
         let mut node = Owned::new(BinEntry::Node(Node {
             key,
-            value: Owned::new(value),
+            value: Atomic::new(Owned::new(value)),
             hash: h,
             next: Atomic::null(),
+            lock: parking_lot::Mutex::new(()),
         }));
 
         // Let node own key, but then take a reference to it for later comparison
@@ -223,7 +225,25 @@ where
                             } else if let BinEntry::Node(Node { value, .. }) = *node.into_box() {
                                 // we want to update
                                 let now_garbage = n.value.swap(value, Ordering::SeqCst, guard);
-                                unimplemented!("need to dispose of garbage");
+                                // safety: need to guarantee that now_garbage is no longer
+                                // reachable. more specifically, no thread that executes _after_
+                                // this line can ever get a reference to now_garbage.
+                                //
+                                // here are the possible cases:
+                                //
+                                // - another thread already has a reference to now_garbage.
+                                //   they must have read it before call to swap.
+                                //   because of this, that thread must be pinned to an epoch <=
+                                //   the epoch of our guard. since the garbage is placed in our
+                                //   epoch, it won't be freed until the _next_ epoch, at which
+                                //   point, that thread must have dropped its guard, and with it,
+                                //   any reference to the value.
+                                // - another thread is about to get a reference to this value.
+                                //   they execute _after_ the swap, and therefor do _not_ get a reference
+                                //   to now_garbage (they get value instead). There are no other
+                                //   ways to get to a value except through its Node's `value` field
+                                //   (which is what we swapped), so freeing now_garbage is fine.
+                                unsafe { guard.defer_destroy(now_garbage) };
                             } else {
                                 unreachable!();
                             }
@@ -446,7 +466,34 @@ where
                     self.next_table.store(Shared::null(), Ordering::SeqCst);
                     //old table that we are now finnished moving stuff out off
                     let now_garbage = self.table.swap(next_table, Ordering::SeqCst, guard);
-                    unimplemented!("do something with garbage");
+                    // safety: need to guarantee that now_garbage is no longer
+                    // reachable. more specifically, no thread that executes _after_
+                    // this line can ever get a reference to now_garbage.
+                    //
+                    // first, we need to argue that there is no _other_ way to get to now_garbage.
+                    //
+                    // - it is _not_ accessible through self.table any more
+                    // - it is _not_ accessible through self.next_table any more
+                    // - what about forwarding nodes (BinEntry::Moved)?
+                    //   the only BinEntry::Moved that point to now_garbage, are the ones in
+                    //   _previous_ tables. To get to those previous tables, one must ultimately
+                    //   have arrived through self.table (because that's where all operations start
+                    //   their search). Since self.table has now changed, only "old" threads can
+                    //   still hbe accessing them. No new thread can get to past tables, and
+                    //   therefor they cannot get to ::Moced that point to now_garbage, so
+                    //   we're fine.
+                    //
+                    // this means that no _future_ thread (i.e., in a later epoch where the value
+                    // may be freed) can get a reference to now_garbage.
+                    // here are the possible cases:
+                    //
+                    // next, let's talk about threads with _existing_ references to now_garbage.
+                    // such a thread must have gotten that reference before the call to swap.
+                    // Because of this, that thread must be pinned to an epoch <= the epoch of our
+                    // guard (since our guard is pinning the epoch). since the garbage is placed in
+                    // our epoch, it won't be freed until _next_ epoch, at which point, that thread
+                    // must have dropped its guard, and with it, any references to that value.
+                    unsafe { guard.defer_destroy(now_garbage) };
                     self.size_ctl.store((n << 1) - (n >> 1), Ordering::SeqCst);
                     return;
                 }
@@ -552,7 +599,6 @@ where
                             next: Atomic::from(*link),
                         })
                         .into_shared(guard);
-                        //WHY: what is happening here with owned -> share etc
 
                         p = p.next.load(Ordering::SeqCst, guard);
                     }
@@ -560,6 +606,25 @@ where
                     next_table.store_bin(i, low_bin);
                     next_table.store_bin(i + n, high_bin);
                     table.store_bin(i, Owned::new(BinEntry::Moved(next_table.as_raw())));
+
+                    // everything up to last_run in the _old_ bin linked list is now garbage.
+                    // those nodes have all been re-allocated in the new bin linked list.
+                    p = head;
+                    while p != last_run {
+                        // safety:
+                        //
+                        // We need to argue there is no longer a way to access p.
+                        // the only way to get to p is through table[i]. since table[i] has been
+                        // replaced by a BinEntry::Moved, p is no longer accessible.
+                        //
+                        // any existing reference to p must have been taken before table.store_bin,
+                        // at that time we had the epoch pinned, so any threads that have such a
+                        // reference must eb before or at our epoch. Since the p isn't destroyed
+                        // until the next epoch, those old references are fine since they are tied
+                        // to those old thread's pins of the old epoch.
+                        unsafe { guard.defer_destroy(p) };
+                        p = p.next.load(Ordering::SeqCst, guard);
+                    }
                     advance = true;
                 }
             }
@@ -617,8 +682,72 @@ where
     }
 }
 
+impl<K, V, S> Drop for ConcurrentHashMap<K, V, S> {
+    fn drop(&mut self) {
+        // safety: we have &mut self, so not concurrently accessed by anyone else
+        let guard = unsafe { crossbeam::epoch::unprotected() };
+
+        assert!(self.next_table.load(Ordering::SeqCst, guard).is_null());
+        let table = self.table.load(Ordering::SeqCst, guard);
+        for bin in &table.bins {
+            let bin = bin.swap(Shared::null(), Ordering::SeqCst, guard);
+            match *bin {
+                BinEntry::Moved(_) => {
+                    // safety: we're dropping the entire map, so no-one else is accessing it.
+                    // we also replaced the bin with a NULL so there is no future way to access it
+                    // either.
+                    unsafe { guard.defer_destroy(bin) };
+                }
+                BinEntry::Node(ref head) => {
+                    let mut p = Shared::from(head);
+                    while !p.is_null() {
+                        // safety below:
+                        // we're dropping the entire map, so no-one else is accessing it.
+                        // we also replaced the bin with a NULL so there is no future way to access it
+                        // either; we own all the nodes in the list.
+
+                        // first, drop the value in this node
+                        let value = p.value.swap(Shared::null(), Ordering::SeqCst, guard);
+                        unsafe { guard.defer_destroy(value) };
+
+                        // then we move to the next node
+                        let next = p.next.load(Ordering::SeqCst, guard);
+
+                        // and drop the one we passed through
+                        unsafe { guard.defer_destroy(p) };
+                        p = next;
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct Table<K, V> {
     bins: Box<[Atomic<node::BinEntry<K, V>>]>,
+}
+
+impl<K, V> Drop for Table<K, V> {
+    fn drop(&mut self) {
+        // we need to drop any forwarding nodes (since they are heap allocated).
+
+        // safety below:
+        // no-one else is accessing this Table any more, so we own all its contents,
+        // which is all we are going to use this guard for.
+        let guard = unsafe { crossbeam::epoch::unprotected() };
+
+        for bin in &mut self.bins {
+            let bin = bin.swap(Shared::null(), Ordering::SeqCst, guard);
+            if bin.is_null() {
+                continue;
+            }
+            if let BinEntry::Moved(_) = *bin {
+                unsafe { guard.defer_destroy(bin) };
+            } else {
+                unreachable!("dropped table with non-empty bin")
+            }
+        }
+    }
 }
 
 impl<K, V> Table<K, V> {
